@@ -45,14 +45,105 @@ static void CheckError(OSStatus err, const char *operation)
 }
 
 // 5.14
+static void MyCopyEncoderCookieToQueue(AudioFileID theFile, AudioQueueRef queue)
+{
+    UInt32 propertySize;
+    OSStatus err = AudioFileGetPropertyInfo(theFile,
+                                            kAudioFilePropertyMagicCookieData,
+                                            &propertySize,
+                                            NULL);
+    
+    if (err == noErr && propertySize > 0) {
+        Byte *magicCookie = (Byte *)malloc(propertySize);
+        
+        err = AudioFileGetProperty(theFile,
+                                   kAudioFilePropertyMagicCookieData,
+                                   &propertySize,
+                                   magicCookie);
+        CheckError(err, "Get cookie from file failed");
+        
+        err = AudioQueueSetProperty(queue,
+                                    kAudioQueueProperty_MagicCookie,
+                                    magicCookie,
+                                    propertySize);
+        CheckError(err, "Set cookie on file failed");
+        
+        free(magicCookie);
+    }
+}
+
 // 5.15
+static void CalculateBytesForTime(AudioFileID inAudioFile,
+                                  AudioStreamBasicDescription inDesc,
+                                  Float64 seconds,
+                                  UInt32 *outBufferSize,
+                                  UInt32 *outNumPackets)
+{
+    // Grab the max packet size as defined by the audio file.
+    UInt32 maxPacketSize;
+    UInt32 propSize = sizeof(maxPacketSize);
+    OSStatus err = AudioFileGetProperty(inAudioFile,
+                                        kAudioFilePropertyPacketSizeUpperBound,
+                                        &propSize,
+                                        &maxPacketSize);
+    CheckError(err, "Couldn't get file's max packet size");
+    
+    static const int maxBufferSize = 0x10000; // 64 kB
+    static const int minBufferSize = 0x4000; // 16 kB
+    
+    // If frames per packet is defined, then we compute the # of packets for the given time.
+    if (inDesc.mFramesPerPacket) {
+        Float64 numPacketsForTime = inDesc.mSampleRate / inDesc.mFramesPerPacket * seconds;
+        *outBufferSize = numPacketsForTime * maxPacketSize;
+    } else {
+        *outBufferSize = maxBufferSize > maxPacketSize ? maxBufferSize : maxPacketSize;
+    }
+    
+    // Apply boundary checks.
+    if (*outBufferSize > maxBufferSize && *outBufferSize > maxPacketSize) {
+        *outBufferSize = maxBufferSize;
+    } else {
+        if (*outBufferSize < minBufferSize) {
+            *outBufferSize = minBufferSize;
+        }
+    }
+    
+    *outNumPackets = *outBufferSize / maxPacketSize;
+}
 
 # pragma mark playback callback function
 static void MyAQOutputCallback(void *inUserData,
                                AudioQueueRef inAQ,
                                AudioQueueBufferRef inCompleteAQBuffer)
 {
-    // TODO:
+    MyPlayer *aqp = (MyPlayer *)inUserData;
+    if (aqp->isDone) return;
+    
+    UInt32 numBytes;
+    UInt32 nPackets = aqp->numPacketsToRead;
+    OSStatus err = AudioFileReadPackets(aqp->playbackFile,
+                                        false,
+                                        &numBytes,
+                                        aqp->packetDescs,
+                                        aqp->packetPosition,
+                                        &nPackets,
+                                        inCompleteAQBuffer->mAudioData);
+    CheckError(err, "AudioFileReadPackets failed");
+    
+    if (nPackets > 0) {
+        inCompleteAQBuffer->mAudioDataByteSize = numBytes;
+        err = AudioQueueEnqueueBuffer(inAQ,
+                                      inCompleteAQBuffer,
+                                      aqp->packetDescs ? nPackets : 0,
+                                      aqp->packetDescs);
+        CheckError(err, "AudioQueueEnqueueBuffer failed");
+        
+        aqp->packetPosition += nPackets;
+    } else {
+        err = AudioQueueStop(inAQ,
+                             false);
+        CheckError(err, "AudioQueueStop failed");
+    }
 }
 
 int main(int argc, const char * argv[]) {
@@ -61,7 +152,8 @@ int main(int argc, const char * argv[]) {
         MyPlayer player = { 0 };
         
         // Open the desired audio file for playback and read it into the user struct
-        NSURL *fileURL = [[NSBundle mainBundle] URLForResource:@"time-passing" withExtension:@"mp3"];
+        NSString *filePath = @"/Users/manthanshah/Desktop/Learning-Core-Audio/CAPlayer/CAPlayer/time-passing.mp3";
+        NSURL *fileURL = [NSURL fileURLWithPath:filePath];
         OSStatus err = AudioFileOpenURL((__bridge CFURLRef)fileURL,
                                         kAudioFileReadPermission,
                                         0,
@@ -93,11 +185,11 @@ int main(int argc, const char * argv[]) {
         // to inspect the elements of the audio file to figure out how large the buffers should
         // be, and the numbers of packets being read on each callback.
         UInt32 bufferBytesSize;
-        CalculatBytesForTime(player.playbackFile,
-                             dataFormat,
-                             0.5,
-                             &bufferBytesSize,
-                             &player.numPacketsToRead);
+        CalculateBytesForTime(player.playbackFile,
+                              dataFormat,
+                              0.5,
+                              &bufferBytesSize,
+                              &player.numPacketsToRead);
         
         // Determine if we are dealing with variable bit rate, which means the frames per
         // packet will vary.
